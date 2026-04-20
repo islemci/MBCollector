@@ -7,15 +7,15 @@ const redis = new Redis({
 });
 
 const POOLS = [
-    { name: 'SupportXMR', url: 'https://www.supportxmr.com/api/pool/stats' },
-    { name: 'NanoPool', url: 'https://api.nanopool.org/v1/xmr/pool/hashrate' },
-    { name: 'P2Pool', url: 'https://p2pool.io/api/pool/stats' },
-    { name: 'Hashvault', url: 'https://api.hashvault.pro/v3/monero' },
-    { name: 'C3Pool', url: 'https://api.c3pool.org/pool/stats' },
-    { name: 'MoneroOcean', url: 'https://api.moneroocean.stream/pool/stats' },
-    { name: 'SkyPool', url: 'https://api.skypool.xyz/pool/stats' },
-    { name: 'XMRPoolEU', url: 'https://web.xmrpool.eu:8119/stats' },
-    { name: 'Monerod', url: 'https://np-api.monerod.org/pool/stats' }
+    { name: 'SupportXMR', url: 'https://www.supportxmr.com/api/pool/stats', homeUrl: 'https://www.supportxmr.com' },
+    { name: 'NanoPool', url: 'https://api.nanopool.org/v1/xmr/pool/hashrate', homeUrl: 'https://xmr.nanopool.org/' },
+    { name: 'P2Pool', url: 'https://p2pool.io/api/pool/stats', homeUrl: 'https://p2pool.io' },
+    { name: 'Hashvault', url: 'https://api.hashvault.pro/v3/monero', homeUrl: 'https://hashvault.pro/monero/' },
+    { name: 'C3Pool', url: 'https://api.c3pool.org/pool/stats', homeUrl: 'https://c3pool.org' },
+    { name: 'MoneroOcean', url: 'https://api.moneroocean.stream/pool/stats', homeUrl: 'https://moneroocean.stream' },
+    { name: 'SkyPool', url: 'https://api.skypool.xyz/pool/stats', homeUrl: 'https://pool.skypool.xyz/search/cpu' },
+    { name: 'XMRPoolEU', url: 'https://web.xmrpool.eu:8119/stats', homeUrl: 'https://xmrpool.eu' },
+    { name: 'Monerod', url: 'https://np-api.monerod.org/pool/stats', homeUrl: 'https://monerod.org' }
 ];
 
 type NodeConfig = {
@@ -29,8 +29,6 @@ const NODES = [
     { name: '0xRPC', url: 'https://xmr.0xrpc.io/get_info' },
     { name: 'MoneroNodeOrg', url: 'http://moneronode.org:18081/get_info' },
     { name: 'Mullvad', url: 'http://monero.mullvad.net:18081/get_info' },
-    { name: 'MonyST', url: 'http://mony.st:18081/get_info' },
-    { name: 'NackCafe', url: 'http://xmr.nack.cafe:18081/get_info' }
 ] as const satisfies ReadonlyArray<NodeConfig>;
 
 type NodeInfo = {
@@ -177,6 +175,8 @@ async function aggregate() {
         nodes: nodeResults,
         pools: POOLS.map((p, i) => ({
             name: p.name,
+            homeUrl: p.homeUrl,
+            apiUrl: p.url,
             hashrate: poolResults[i] ? roundUpHashrate(extractHash(p.name, poolResults[i])) : 0,
             status: poolResults[i] ? 'online' : 'offline'
         })),
