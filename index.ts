@@ -29,7 +29,6 @@ const NODES = [
     { name: '0xRPC', url: 'https://xmr.0xrpc.io/get_info' },
     { name: 'MoneroNodeOrg', url: 'http://moneronode.org:18081/get_info' },
     { name: 'Mullvad', url: 'http://monero.mullvad.net:18081/get_info' },
-    { name: 'SethForPrivacyMirror', url: 'https://node.sethforprivacy.com/get_info' },
     { name: 'MonyST', url: 'http://mony.st:18081/get_info' },
     { name: 'NackCafe', url: 'http://xmr.nack.cafe:18081/get_info' }
 ] as const satisfies ReadonlyArray<NodeConfig>;
