@@ -272,6 +272,5 @@ function extractHash(name: string, data: any): number {
     }
 }
 
-// 30-second loop
-setInterval(aggregate, 30000);
+setInterval(aggregate, 90000);
 aggregate();
