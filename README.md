@@ -6,6 +6,13 @@ MoneroBar Collector fetches Monero network and pool statistics, normalizes hashr
 
 - Network height and difficulty from multiple Monero nodes
 - Calculated network hashrate
+- CoinGecko market + metadata snapshot stored in Redis key `monero:info`, including:
+	- XMR price (USD)
+	- 24h total volume (USD)
+	- market cap (USD)
+	- 24h price change percentage
+	- 24h low/high (USD)
+	- extra dashboard metrics (7d/30d/1y change, ATH/ATL, supply, sentiment, links)
 - Pool hashrates and online/offline status for:
 	- SupportXMR
 	- NanoPool
@@ -43,4 +50,12 @@ bun install
 bun run index.ts
 ```
 
-The collector runs immediately and then repeats every 30 seconds.
+The collector runs immediately and then repeats on separate schedules:
+
+- `monero:stats` (network/pools): every 90 seconds
+- `monero:info` (CoinGecko): every 5 minutes
+
+## Redis Keys
+
+- `monero:stats`: network + node + pool aggregate
+- `monero:info`: CoinGecko Monero asset + market snapshot

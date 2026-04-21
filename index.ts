@@ -24,7 +24,7 @@ type NodeConfig = {
 };
 
 const NODES = [
-    { name: 'SethForPrivacy', url: 'https://node.sethforprivacy.com/get_info' },
+   /* { name: 'SethForPrivacy', url: 'https://node.sethforprivacy.com/get_info' }, To be added later as they currently block requests */
     { name: 'SupportXMR', url: 'http://xmr.support:18081/get_info' },
     { name: '0xRPC', url: 'https://xmr.0xrpc.io/get_info' },
     { name: 'MoneroNodeOrg', url: 'http://moneronode.org:18081/get_info' },
@@ -49,6 +49,121 @@ type NetworkConsensus = {
     height: number;
     difficulty: number;
 };
+
+type CoinGeckoMoneroResponse = {
+    id?: string;
+    symbol?: string;
+    name?: string;
+    hashing_algorithm?: string | null;
+    block_time_in_minutes?: number | null;
+    genesis_date?: string | null;
+    sentiment_votes_up_percentage?: number | null;
+    sentiment_votes_down_percentage?: number | null;
+    watchlist_portfolio_users?: number | null;
+    market_cap_rank?: number | null;
+    image?: {
+        thumb?: string;
+        small?: string;
+        large?: string;
+    };
+    links?: {
+        homepage?: string[];
+        subreddit_url?: string | null;
+        repos_url?: {
+            github?: string[];
+        };
+    };
+    market_data?: {
+        current_price?: { usd?: number };
+        total_volume?: { usd?: number };
+        market_cap?: { usd?: number };
+        low_24h?: { usd?: number };
+        high_24h?: { usd?: number };
+        ath?: { usd?: number };
+        atl?: { usd?: number };
+        ath_change_percentage?: { usd?: number };
+        atl_change_percentage?: { usd?: number };
+        circulating_supply?: number;
+        total_supply?: number;
+        max_supply?: number | null;
+        max_supply_infinite?: boolean;
+        price_change_24h?: number;
+        price_change_percentage_24h?: number;
+        price_change_percentage_7d?: number;
+        price_change_percentage_30d?: number;
+        price_change_percentage_1y?: number;
+        market_cap_change_24h?: number;
+        market_cap_change_percentage_24h?: number;
+        last_updated?: string;
+    };
+    last_updated?: string;
+};
+
+function toFiniteNumber(value: unknown): number | null {
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+        return null;
+    }
+
+    return value;
+}
+
+function buildMoneroInfoPayload(data: CoinGeckoMoneroResponse) {
+    const market = data.market_data;
+
+    return {
+        asset: {
+            id: data.id ?? 'monero',
+            symbol: data.symbol ?? 'xmr',
+            name: data.name ?? 'Monero',
+            hashingAlgorithm: data.hashing_algorithm ?? null,
+            blockTimeMinutes: toFiniteNumber(data.block_time_in_minutes),
+            genesisDate: data.genesis_date ?? null,
+            marketCapRank: toFiniteNumber(data.market_cap_rank),
+            image: {
+                thumb: data.image?.thumb ?? null,
+                small: data.image?.small ?? null,
+                large: data.image?.large ?? null
+            },
+            links: {
+                homepage: data.links?.homepage?.[0] ?? null,
+                subreddit: data.links?.subreddit_url ?? null,
+                github: data.links?.repos_url?.github?.[0] ?? null
+            }
+        },
+        market: {
+            priceUsd: toFiniteNumber(market?.current_price?.usd),
+            totalVolumeUsd: toFiniteNumber(market?.total_volume?.usd),
+            marketCapUsd: toFiniteNumber(market?.market_cap?.usd),
+            low24hUsd: toFiniteNumber(market?.low_24h?.usd),
+            high24hUsd: toFiniteNumber(market?.high_24h?.usd),
+            priceChange24hUsd: toFiniteNumber(market?.price_change_24h),
+            priceChange24hPct: toFiniteNumber(market?.price_change_percentage_24h),
+            priceChange7dPct: toFiniteNumber(market?.price_change_percentage_7d),
+            priceChange30dPct: toFiniteNumber(market?.price_change_percentage_30d),
+            priceChange1yPct: toFiniteNumber(market?.price_change_percentage_1y),
+            marketCapChange24hUsd: toFiniteNumber(market?.market_cap_change_24h),
+            marketCapChange24hPct: toFiniteNumber(market?.market_cap_change_percentage_24h),
+            athUsd: toFiniteNumber(market?.ath?.usd),
+            athChangePct: toFiniteNumber(market?.ath_change_percentage?.usd),
+            atlUsd: toFiniteNumber(market?.atl?.usd),
+            atlChangePct: toFiniteNumber(market?.atl_change_percentage?.usd)
+        },
+        supply: {
+            circulating: toFiniteNumber(market?.circulating_supply),
+            total: toFiniteNumber(market?.total_supply),
+            max: toFiniteNumber(market?.max_supply),
+            maxSupplyInfinite: market?.max_supply_infinite ?? null
+        },
+        sentiment: {
+            upVotesPct: toFiniteNumber(data.sentiment_votes_up_percentage),
+            downVotesPct: toFiniteNumber(data.sentiment_votes_down_percentage),
+            watchlistUsers: toFiniteNumber(data.watchlist_portfolio_users)
+        },
+        source: 'coingecko',
+        sourceUpdatedAt: market?.last_updated ?? data.last_updated ?? null,
+        updatedAt: Date.now()
+    };
+}
 
 function getMajorityNetworkTruth(nodes: NodeMetric[]): NetworkConsensus {
     const validNodes = nodes.filter(
@@ -111,14 +226,13 @@ function roundUpHashrate(value: number): number {
     return Math.ceil(value);
 }
 
+const fetchWithTimeout = <T>(url: string): Promise<T | null> =>
+    fetch(url, { signal: AbortSignal.timeout(5000) })
+        .then(res => res.json() as Promise<T>)
+        .catch(() => null);
+
 async function aggregate() {
     console.log(`[${new Date().toISOString()}] Starting aggregation...`);
-
-    // Parallel fetch with 5-second timeout using native AbortSignal
-    const fetchWithTimeout = <T>(url: string): Promise<T | null> =>
-        fetch(url, { signal: AbortSignal.timeout(5000) })
-            .then(res => res.json() as Promise<T>)
-            .catch(() => null);
 
     const fetchNodeWithMetrics = async (node: NodeConfig): Promise<NodeMetric> => {
         const startedAt = Date.now();
@@ -185,7 +299,26 @@ async function aggregate() {
 
     // Push to Upstash
     await redis.set("monero:stats", payload);
+
     console.log(`Done. Height: ${bestHeight}`);
+}
+
+async function collectMoneroInfo() {
+    console.log(`[${new Date().toISOString()}] Fetching CoinGecko monero info...`);
+
+    const coingeckoData = await fetchWithTimeout<CoinGeckoMoneroResponse>(
+        'https://api.coingecko.com/api/v3/coins/monero?localization=false&tickers=false&community_data=false&developer_data=false&sparkline=false'
+    );
+
+    if (!coingeckoData) {
+        console.log('CoinGecko fetch failed. Keeping last monero:info payload.');
+        return;
+    }
+
+    const moneroInfo = buildMoneroInfoPayload(coingeckoData);
+    await redis.set("monero:info", moneroInfo);
+
+    console.log('Done. Updated monero:info.');
 }
 
 function extractHash(name: string, data: any): number {
@@ -273,4 +406,7 @@ function extractHash(name: string, data: any): number {
 }
 
 setInterval(aggregate, 90000);
+setInterval(collectMoneroInfo, 300000);
+
 aggregate();
+collectMoneroInfo();
