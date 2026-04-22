@@ -9,6 +9,7 @@ if (!redisUrl) {
 const redis = new Redis(redisUrl);
 
 const MONERO_DAEMON_URL = 'http://monero.mullvad.net:18081';
+const MONERO_DAEMON_NAME = 'Mullvad';
 const MONERO_JSON_RPC_URL = `${MONERO_DAEMON_URL}/json_rpc`;
 const BLOCKS_TO_COLLECT = 10;
 const EXPLORER_BLOCKS_TO_COLLECT = 100;
@@ -689,7 +690,7 @@ async function collectExplorerBlocks() {
             latestHeight: latestBlockHeight,
             count: blocksToStore.length
         },
-        node: MONERO_DAEMON_URL,
+        node: MONERO_DAEMON_NAME,
         blocks: blocksToStore,
         collectedTxCount: 0,
         mode: 'headers-only',
@@ -746,7 +747,7 @@ async function collectRecentBlocks(latestHeight: number) {
             count: blocks.length
         },
         blocks,
-        node: MONERO_JSON_RPC_URL,
+        node: MONERO_DAEMON_NAME,
         updatedAt: Date.now()
     });
 
