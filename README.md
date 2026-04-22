@@ -6,6 +6,16 @@ MoneroBar Collector fetches Monero network and pool statistics, normalizes hashr
 
 - Network height and difficulty from multiple Monero nodes
 - Calculated network hashrate
+- Latest 10 Monero block headers from JSON-RPC (`get_block_headers_range`) stored in Redis key `monero:blocks`, including:
+	- height
+	- timestamp (unix)
+	- difficulty
+	- reward
+	- num_txes
+	- hash
+	- orphan_status
+	- depth
+	- cumulative_difficulty
 - CoinGecko market + metadata snapshot stored in Redis key `monero:info`, including:
 	- XMR price (USD)
 	- 24h total volume (USD)
@@ -58,4 +68,5 @@ The collector runs immediately and then repeats on separate schedules:
 ## Redis Keys
 
 - `monero:stats`: network + node + pool aggregate
+- `monero:blocks`: last 10 block headers from Monero JSON-RPC
 - `monero:info`: CoinGecko Monero asset + market snapshot
