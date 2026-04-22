@@ -1,6 +1,6 @@
 # MoneroBar Collector
 
-MoneroBar Collector fetches Monero network and pool statistics, normalizes hashrates from multiple pool APIs, and stores the aggregated payload in Upstash Redis.
+MoneroBar Collector fetches Monero network and pool statistics, normalizes hashrates from multiple pool APIs, and stores the aggregated payload in Redis via `ioredis`.
 
 ## What It Collects
 
@@ -37,15 +37,14 @@ MoneroBar Collector fetches Monero network and pool statistics, normalizes hashr
 ## Requirements
 
 - Bun
-- Upstash Redis database
+- Redis database accessible from the collector host
 
 ## Environment Variables
 
 Create a `.env` file with:
 
 ```env
-UPSTASH_REDIS_REST_URL=your_upstash_redis_url
-UPSTASH_REDIS_REST_TOKEN=your_upstash_redis_token
+REDIS_URL=redis://localhost:6379
 ```
 
 ## Install

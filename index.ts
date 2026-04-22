@@ -1,10 +1,12 @@
-// No imports needed for fetch in Bun!
-import { Redis } from "@upstash/redis";
+import Redis from "ioredis";
 
-const redis = new Redis({
-    url: Bun.env.UPSTASH_REDIS_REST_URL!,
-    token: Bun.env.UPSTASH_REDIS_REST_TOKEN!,
-});
+const redisUrl = Bun.env.REDIS_URL;
+
+if (!redisUrl) {
+    throw new Error('Missing REDIS_URL environment variable');
+}
+
+const redis = new Redis(redisUrl);
 
 const MONERO_JSON_RPC_URL = 'http://monero.mullvad.net:18081/json_rpc';
 const BLOCKS_TO_COLLECT = 10;
@@ -290,6 +292,10 @@ function normalizeBlockHeader(header: MoneroBlockHeaderRpc): NormalizedMoneroBlo
     };
 }
 
+async function setRedisJson(key: string, value: unknown): Promise<void> {
+    await redis.set(key, JSON.stringify(value));
+}
+
 async function sleepMs(ms: number): Promise<void> {
     await new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -387,7 +393,7 @@ async function collectRecentBlocks(latestHeight: number) {
 
     const blocks = [...headers].sort((a, b) => (b.height ?? 0) - (a.height ?? 0));
 
-    await redis.set('monero:blocks', {
+    await setRedisJson('monero:blocks', {
         range: {
             startHeight,
             latestHeight: latestBlockHeight,
@@ -473,8 +479,7 @@ async function aggregate() {
         updatedAt: Date.now()
     };
 
-    // Push to Upstash
-    await redis.set("monero:stats", payload);
+    await setRedisJson("monero:stats", payload);
 
     if (bestHeight > 0) {
         await collectRecentBlocks(bestHeight);
@@ -498,7 +503,7 @@ async function collectMoneroInfo() {
     }
 
     const moneroInfo = buildMoneroInfoPayload(coingeckoData);
-    await redis.set("monero:info", moneroInfo);
+    await setRedisJson("monero:info", moneroInfo);
 
     console.log('Done. Updated monero:info.');
 }
