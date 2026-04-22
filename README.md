@@ -16,6 +16,17 @@ MoneroBar Collector fetches Monero network and pool statistics, normalizes hashr
 	- orphan_status
 	- depth
 	- cumulative_difficulty
+- Latest 100 Monero block headers from the Mullvad daemon stored in Redis key `monero:explorer` (headers-only mode), including:
+	- height
+	- hash
+	- timestamp (unix)
+	- difficulty
+	- reward
+	- num_txes (as tx count)
+	- block_weight
+	- prev_hash
+	- nonce
+	- normalized header payload + range metadata (`startHeight`, `latestHeight`, `count`) and source node URL
 - CoinGecko market + metadata snapshot stored in Redis key `monero:info`, including:
 	- XMR price (USD)
 	- 24h total volume (USD)
@@ -68,4 +79,5 @@ The collector runs immediately and then repeats on separate schedules:
 
 - `monero:stats`: network + node + pool aggregate
 - `monero:blocks`: last 10 block headers from Monero JSON-RPC
+- `monero:explorer`: latest 100 blocks (headers-only, no tx decoding)
 - `monero:info`: CoinGecko Monero asset + market snapshot
