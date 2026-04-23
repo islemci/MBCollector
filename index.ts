@@ -949,7 +949,7 @@ function extractHash(name: string, data: any): number {
     }
 }
 
-setInterval(aggregate, 120000);
+setInterval(aggregate, 300000);
 setInterval(collectMoneroInfo, 300000);
 
 aggregate();
