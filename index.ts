@@ -12,7 +12,7 @@ const MONERO_DAEMON_URL = 'http://monero.mullvad.net:18081';
 const MONERO_DAEMON_NAME = 'Mullvad';
 const MONERO_JSON_RPC_URL = `${MONERO_DAEMON_URL}/json_rpc`;
 const BLOCKS_TO_COLLECT = 10;
-const EXPLORER_BLOCKS_TO_COLLECT = 100;
+const EXPLORER_BLOCKS_TO_COLLECT = 700;
 const TXS_PER_REQUEST = 100;
 const BLOCK_FETCH_CONCURRENCY = 5;
 const BLOCK_RPC_TIMEOUT_MS = 7000;
@@ -608,11 +608,14 @@ async function collectExplorerBlocks() {
     const existingRaw = await redis.get('monero:explorer');
     const existingSnapshot = parseExplorerSnapshot(existingRaw);
     const previousLatestHeight = toFiniteInteger(existingSnapshot?.range?.latestHeight);
+    const existingBlocksCount = Array.isArray(existingSnapshot?.blocks) ? existingSnapshot.blocks.length : 0;
+    const hasFullWindowCached = existingBlocksCount >= EXPLORER_BLOCKS_TO_COLLECT;
 
     let headersToStore: NormalizedMoneroBlockHeader[] = [];
 
     const canIncrementalUpdate =
         existingSnapshot !== null
+        && hasFullWindowCached
         && previousLatestHeight !== null
         && previousLatestHeight >= 0
         && latestBlockHeight > previousLatestHeight
