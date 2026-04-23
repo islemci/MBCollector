@@ -817,7 +817,12 @@ async function aggregate() {
     };
 
     const [poolResults, nodeResults] = await Promise.all([
-        Promise.all(POOLS.map(p => fetchWithTimeoutText<any>(p.url))),
+        Promise.all(POOLS.map(async p => {
+            const result = await fetchWithTimeoutText<any>(p.url);
+            const hash = result ? extractHash(p.name, result) : 0;
+            console.log(`[Pool] ${p.name} | status=${result ? 'online' : 'offline'} | raw=${JSON.stringify(result)?.slice(0, 200)} | hash=${hash}`);
+            return result;
+        })),
         Promise.all(NODES.map(node => fetchNodeWithMetrics(node)))
     ]);
 
