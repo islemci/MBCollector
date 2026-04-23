@@ -816,11 +816,30 @@ async function aggregate() {
         }
     };
 
+    // Normalize pool hashrate extraction to prefer API-provided data when available
+    const getPoolHashrateFromApi = (name: string, data: any): number => {
+        try {
+            if (data && typeof data === 'object') {
+                if (typeof data.data === 'number') return data.data;
+                if (typeof data.data === 'string') {
+                    const n = Number(data.data);
+                    if (Number.isFinite(n)) return n;
+                }
+                if (data?.raw && typeof data.raw === 'object' && typeof data.raw.data === 'number') {
+                    return data.raw.data;
+                }
+            }
+        } catch {
+            // fall through to fallback extractor
+        }
+        return extractHash(name, data);
+    };
+
     const [poolResults, nodeResults] = await Promise.all([
         Promise.all(POOLS.map(async p => {
             const result = await fetchWithTimeoutText<any>(p.url);
-            const hash = result ? extractHash(p.name, result) : 0;
-            console.log(`[Pool] ${p.name} | status=${result ? 'online' : 'offline'} | raw=${JSON.stringify(result)?.slice(0, 200)} | hash=${hash}`);
+            const hashApi = getPoolHashrateFromApi(p.name, result);
+            console.log(`[Pool] ${p.name} | status=${result ? 'online' : 'offline'} | raw=${JSON.stringify(result)?.slice(0, 200)} | hash=${hashApi}`);
             return result;
         })),
         Promise.all(NODES.map(node => fetchNodeWithMetrics(node)))
@@ -846,13 +865,25 @@ async function aggregate() {
             difficulty: difficulty
         },
         nodes: nodeResults,
-        pools: POOLS.map((p, i) => ({
-            name: p.name,
-            homeUrl: p.homeUrl,
-            apiUrl: p.url,
-            hashrate: poolResults[i] ? roundUpHashrate(extractHash(p.name, poolResults[i])) : 0,
-            status: poolResults[i] ? 'online' : 'offline'
-        })),
+        pools: POOLS.map((p, i) => {
+            const data = poolResults[i];
+            const hr = (data && typeof data === 'object') ? (() => {
+                if (typeof data.data === 'number') return data.data;
+                if (typeof data.data === 'string') {
+                    const n = Number(data.data);
+                    if (Number.isFinite(n)) return n;
+                }
+                if (data?.raw && typeof data.raw.data === 'number') return data.raw.data;
+                return extractHash(p.name, data);
+            })() : 0;
+            return {
+                name: p.name,
+                homeUrl: p.homeUrl,
+                apiUrl: p.url,
+                hashrate: hr,
+                status: poolResults[i] ? 'online' : 'offline'
+            };
+        }),
         updatedAt: Date.now()
     };
 
