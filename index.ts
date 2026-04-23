@@ -12,11 +12,12 @@ const MONERO_DAEMON_URL = 'http://monero.mullvad.net:18081';
 const MONERO_DAEMON_NAME = 'Mullvad';
 const MONERO_JSON_RPC_URL = `${MONERO_DAEMON_URL}/json_rpc`;
 const BLOCKS_TO_COLLECT = 10;
-const EXPLORER_BLOCKS_TO_COLLECT = 700;
+const EXPLORER_BLOCKS_TO_COLLECT = 2500;
 const TXS_PER_REQUEST = 100;
 const BLOCK_FETCH_CONCURRENCY = 5;
 const BLOCK_RPC_TIMEOUT_MS = 7000;
 const BLOCK_RPC_MAX_RETRIES = 2;
+const MAX_HEADERS_PER_RANGE_REQUEST = 500;
 
 let lastBlocksHeightFetched: number | null = null;
 let lastExplorerHeightFetched: number | null = null;
@@ -207,12 +208,6 @@ type ExplorerSnapshot = {
         count?: number;
     };
     blocks?: ExplorerBlockRecord[];
-};
-
-type ExplorerHeadersWindow = {
-    latestBlockHeight: number;
-    startHeight: number;
-    heightsDesc: number[];
 };
 
 function toFiniteNumber(value: unknown): number | null {
@@ -445,6 +440,51 @@ function parseExplorerSnapshot(value: string | null): ExplorerSnapshot | null {
     }
 }
 
+function getMissingHeightRanges(startHeight: number, endHeight: number, presentHeights: Set<number>): Array<{ startHeight: number; endHeight: number }> {
+    const ranges: Array<{ startHeight: number; endHeight: number }> = [];
+    let cursor = startHeight;
+
+    while (cursor <= endHeight) {
+        if (presentHeights.has(cursor)) {
+            cursor += 1;
+            continue;
+        }
+
+        const rangeStart = cursor;
+        while (cursor <= endHeight && !presentHeights.has(cursor)) {
+            cursor += 1;
+        }
+
+        ranges.push({
+            startHeight: rangeStart,
+            endHeight: cursor - 1
+        });
+    }
+
+    return ranges;
+}
+
+function splitHeightRange(startHeight: number, endHeight: number, maxPerRange: number): Array<{ startHeight: number; endHeight: number }> {
+    const ranges: Array<{ startHeight: number; endHeight: number }> = [];
+
+    if (maxPerRange <= 0 || endHeight < startHeight) {
+        return ranges;
+    }
+
+    let cursor = startHeight;
+
+    while (cursor <= endHeight) {
+        const chunkEnd = Math.min(endHeight, cursor + maxPerRange - 1);
+        ranges.push({
+            startHeight: cursor,
+            endHeight: chunkEnd
+        });
+        cursor = chunkEnd + 1;
+    }
+
+    return ranges;
+}
+
 async function callMoneroJsonRpc<T>(method: string, params?: Record<string, unknown>): Promise<T | null> {
     for (let attempt = 0; attempt <= BLOCK_RPC_MAX_RETRIES; attempt += 1) {
         try {
@@ -553,30 +593,6 @@ async function fetchLatestBlockHeightFromMullvad(): Promise<number | null> {
     return Math.max(0, height - 1);
 }
 
-async function getExplorerHeadersWindow(latestBlockHeight: number): Promise<ExplorerHeadersWindow | null> {
-    const startHeight = Math.max(0, latestBlockHeight - (EXPLORER_BLOCKS_TO_COLLECT - 1));
-    const headers = await fetchLatestBlockHeadersRange(startHeight, latestBlockHeight);
-
-    if (!headers || headers.length === 0) {
-        return null;
-    }
-
-    const heightsDesc = headers
-        .map(header => header.height)
-        .filter((height): height is number => typeof height === 'number' && Number.isFinite(height))
-        .sort((a, b) => b - a);
-
-    if (heightsDesc.length === 0) {
-        return null;
-    }
-
-    return {
-        latestBlockHeight,
-        startHeight: heightsDesc[heightsDesc.length - 1] ?? startHeight,
-        heightsDesc
-    };
-}
-
 async function fetchFullBlockByHeight(height: number): Promise<MoneroGetBlockResult | null> {
     return callMoneroJsonRpc<MoneroGetBlockResult>('get_block', { height });
 }
@@ -594,81 +610,70 @@ async function collectExplorerBlocks() {
 
     if (lastExplorerHeightFetched === latestBlockHeight) {
         console.log(`Skipping monero:explorer update, height unchanged at ${latestBlockHeight}.`);
-        return;
     }
 
-    const headersWindow = await getExplorerHeadersWindow(latestBlockHeight);
-    if (!headersWindow) {
-        console.log('Skipping monero:explorer update, unable to fetch latest header window.');
-        return;
-    }
-
-    console.log(`[Explorer] Header window ready (${headersWindow.heightsDesc.length} headers).`);
+    const targetStartHeight = Math.max(0, latestBlockHeight - (EXPLORER_BLOCKS_TO_COLLECT - 1));
+    const targetEndHeight = latestBlockHeight;
 
     const existingRaw = await redis.get('monero:explorer');
     const existingSnapshot = parseExplorerSnapshot(existingRaw);
-    const previousLatestHeight = toFiniteInteger(existingSnapshot?.range?.latestHeight);
-    const existingBlocksCount = Array.isArray(existingSnapshot?.blocks) ? existingSnapshot.blocks.length : 0;
-    const hasFullWindowCached = existingBlocksCount >= EXPLORER_BLOCKS_TO_COLLECT;
+    const mergedByHeight = new Map<number, NormalizedMoneroBlockHeader>();
 
-    let headersToStore: NormalizedMoneroBlockHeader[] = [];
-
-    const canIncrementalUpdate =
-        existingSnapshot !== null
-        && hasFullWindowCached
-        && previousLatestHeight !== null
-        && previousLatestHeight >= 0
-        && latestBlockHeight > previousLatestHeight
-        && latestBlockHeight - previousLatestHeight < EXPLORER_BLOCKS_TO_COLLECT;
-
-    if (canIncrementalUpdate) {
-        const incrementalStart = previousLatestHeight + 1;
-        const incrementalHeaders = (await fetchLatestBlockHeadersRange(incrementalStart, latestBlockHeight)) ?? [];
-
-        const mergedByHeight = new Map<number, NormalizedMoneroBlockHeader>();
-
-        for (const header of incrementalHeaders) {
-            if (header.height !== null) {
-                mergedByHeight.set(header.height, header);
-            }
+    for (const block of existingSnapshot?.blocks ?? []) {
+        const height = typeof block?.height === 'number' ? block.height : null;
+        if (height === null || height < targetStartHeight || height > targetEndHeight) {
+            continue;
         }
 
-        for (const block of existingSnapshot.blocks ?? []) {
-            const height = typeof block?.height === 'number' ? block.height : null;
-            if (height === null || mergedByHeight.has(height)) {
-                continue;
-            }
+        const normalizedHeader = block.header ?? {
+            height,
+            timestamp: toFiniteInteger(block.timestamp),
+            difficulty: toFiniteInteger(block.difficulty),
+            reward: toFiniteInteger(block.reward),
+            numTxes: toFiniteInteger(block.txCount),
+            hash: typeof block.hash === 'string' ? block.hash : null,
+            orphanStatus: null,
+            depth: null,
+            cumulativeDifficulty: null,
+            blockWeight: toFiniteInteger(block.blockWeight),
+            prevHash: typeof block.prevHash === 'string' ? block.prevHash : null,
+            nonce: toFiniteInteger(block.nonce)
+        };
 
-            mergedByHeight.set(height, {
-                height,
-                timestamp: toFiniteInteger(block.timestamp),
-                difficulty: toFiniteInteger(block.difficulty),
-                reward: toFiniteInteger(block.reward),
-                numTxes: toFiniteInteger(block.txCount),
-                hash: typeof block.hash === 'string' ? block.hash : null,
-                orphanStatus: null,
-                depth: null,
-                cumulativeDifficulty: null,
-                blockWeight: toFiniteInteger(block.blockWeight),
-                prevHash: typeof block.prevHash === 'string' ? block.prevHash : null,
-                nonce: toFiniteInteger(block.nonce)
-            });
-        }
-
-        headersToStore = [...mergedByHeight.values()]
-            .sort((a, b) => (b.height ?? 0) - (a.height ?? 0))
-            .slice(0, EXPLORER_BLOCKS_TO_COLLECT);
-    } else {
-        const headers = await fetchLatestBlockHeadersRange(headersWindow.startHeight, headersWindow.latestBlockHeight);
-        if (!headers || headers.length === 0) {
-            console.log('Skipping monero:explorer update, failed to fetch header range.');
-            return;
-        }
-
-        headersToStore = [...headers]
-            .sort((a, b) => (b.height ?? 0) - (a.height ?? 0))
-            .slice(0, EXPLORER_BLOCKS_TO_COLLECT);
+        mergedByHeight.set(height, {
+            ...normalizedHeader,
+            height
+        });
     }
+
+    const presentHeights = new Set<number>(mergedByHeight.keys());
+    const missingRanges = getMissingHeightRanges(targetStartHeight, targetEndHeight, presentHeights);
+
+    if (missingRanges.length > 0) {
+        console.log(`[Explorer] Missing ${missingRanges.length} range(s), fetching ${missingRanges.reduce((acc, r) => acc + (r.endHeight - r.startHeight + 1), 0)} headers...`);
+    }
+
+    for (const range of missingRanges) {
+        const chunkedRanges = splitHeightRange(range.startHeight, range.endHeight, MAX_HEADERS_PER_RANGE_REQUEST);
+
+        for (const chunk of chunkedRanges) {
+            const headers = await fetchLatestBlockHeadersRange(chunk.startHeight, chunk.endHeight);
+            if (!headers) {
+                console.log(`Skipping monero:explorer update, failed to fetch missing range ${chunk.startHeight}-${chunk.endHeight}.`);
+                return;
+            }
+
+            for (const header of headers) {
+                if (header.height !== null && header.height >= targetStartHeight && header.height <= targetEndHeight) {
+                    mergedByHeight.set(header.height, header);
+                }
+            }
+        }
+    }
+
+    const headersToStore = [...mergedByHeight.values()]
+        .sort((a, b) => (b.height ?? 0) - (a.height ?? 0))
+        .slice(0, EXPLORER_BLOCKS_TO_COLLECT);
 
     const blocksToStore: ExplorerBlockRecord[] = headersToStore
         .filter((header): header is NormalizedMoneroBlockHeader & { height: number } => header.height !== null)
@@ -685,7 +690,7 @@ async function collectExplorerBlocks() {
             nonce: header.nonce
         }));
 
-    const startHeight = blocksToStore.at(-1)?.height ?? headersWindow.startHeight;
+    const startHeight = blocksToStore.at(-1)?.height ?? targetStartHeight;
 
     await setRedisJson('monero:explorer', {
         range: {
