@@ -31,7 +31,9 @@ const POOLS = [
     { name: 'MoneroOcean', url: 'https://api.moneroocean.stream/pool/stats', homeUrl: 'https://moneroocean.stream' },
     { name: 'SkyPool', url: 'https://api.skypool.xyz/pool/stats', homeUrl: 'https://pool.skypool.xyz/search/cpu' },
     { name: 'XMRPoolEU', url: 'https://web.xmrpool.eu:8119/stats', homeUrl: 'https://xmrpool.eu' },
-    { name: 'Monerod', url: 'https://np-api.monerod.org/pool/stats', homeUrl: 'https://monerod.org' }
+    { name: 'Monerod', url: 'https://np-api.monerod.org/pool/stats', homeUrl: 'https://monerod.org' },
+    { name: 'SoloPool', url: 'https://xmr.solopool.org/api/stats', homeUrl: 'https://xmr.solopool.org' },
+    { name: 'HeroMiners', url: 'https://monero.herominers.com/api/stats', homeUrl: 'https://monero.herominers.com' }
 ];
 
 type NodeConfig = {
@@ -768,6 +770,21 @@ const fetchWithTimeout = <T>(url: string): Promise<T | null> =>
         .then(res => res.json() as Promise<T>)
         .catch(() => null);
 
+const fetchWithTimeoutText = <T>(url: string): Promise<T | null> =>
+    fetch(url, { signal: AbortSignal.timeout(5000) })
+        .then(async res => {
+            try {
+                return await res.json() as T;
+            } catch {
+                try {
+                    return JSON.parse(await res.text()) as T;
+                } catch {
+                    return null;
+                }
+            }
+        })
+        .catch(() => null);
+
 async function aggregate() {
     console.log(`[${new Date().toISOString()}] Starting aggregation...`);
 
@@ -800,7 +817,7 @@ async function aggregate() {
     };
 
     const [poolResults, nodeResults] = await Promise.all([
-        Promise.all(POOLS.map(p => fetchWithTimeout<any>(p.url))),
+        Promise.all(POOLS.map(p => fetchWithTimeoutText<any>(p.url))),
         Promise.all(NODES.map(node => fetchNodeWithMetrics(node)))
     ]);
 
@@ -935,6 +952,12 @@ function extractHash(name: string, data: any): number {
                 data?.pool?.stats?.hashrate,
                 data?.pool?.stats?.hashRate
             );
+
+        case 'solopool':
+            return firstNumber(data?.hashrate);
+
+        case 'herominers':
+            return firstNumber(data?.pool?.hashrate);
 
         default:
             return firstNumber(
