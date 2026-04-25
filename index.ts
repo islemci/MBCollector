@@ -257,6 +257,28 @@ type ExplorerBlockRecord = {
     nonce: number | null;
 };
 
+type MoneroBlockJson = {
+    prev_id?: string;
+    tx_hashes?: string[];
+};
+
+type ExplorerBlockDetailRecord = {
+    height: number;
+    hash: string | null;
+    prevHash: string | null;
+    timestamp: number | null;
+    difficulty: number | null;
+    reward: number | null;
+    blockWeight: number | null;
+    nonce: number | null;
+    txCount: number;
+    txHashes: string[];
+    minerTxHash: string | null;
+    finder: string | null;
+    sourceNode: string;
+    updatedAt: number;
+};
+
 type ExplorerSnapshot = {
     range?: {
         startHeight?: number;
@@ -641,6 +663,94 @@ function splitHeightRange(startHeight: number, endHeight: number, maxPerRange: n
     return ranges;
 }
 
+function parseMoneroBlockJson(rawJson: unknown): MoneroBlockJson | null {
+    if (typeof rawJson !== 'string' || rawJson.length === 0) {
+        return null;
+    }
+
+    try {
+        const parsed = JSON.parse(rawJson) as MoneroBlockJson;
+        return parsed && typeof parsed === 'object' ? parsed : null;
+    } catch (error) {
+        logWarn('Failed to parse Monero block JSON payload.', {
+            valuePreview: rawJson.slice(0, 200),
+            ...formatError(error)
+        });
+        return null;
+    }
+}
+
+function parseExplorerBlockDetail(value: string | null): ExplorerBlockDetailRecord | null {
+    if (!value) {
+        return null;
+    }
+
+    try {
+        const parsed = JSON.parse(value) as ExplorerBlockDetailRecord;
+        if (!parsed || typeof parsed !== 'object') {
+            return null;
+        }
+
+        return {
+            height: toFiniteInteger(parsed.height) ?? 0,
+            hash: toNonEmptyString(parsed.hash),
+            prevHash: toNonEmptyString(parsed.prevHash),
+            timestamp: toFiniteInteger(parsed.timestamp),
+            difficulty: toFiniteInteger(parsed.difficulty),
+            reward: toFiniteInteger(parsed.reward),
+            blockWeight: toFiniteInteger(parsed.blockWeight),
+            nonce: toFiniteInteger(parsed.nonce),
+            txCount: Math.max(0, toFiniteInteger(parsed.txCount) ?? 0),
+            txHashes: uniqueStrings(toStringArray(parsed.txHashes)),
+            minerTxHash: toNonEmptyString(parsed.minerTxHash),
+            finder: toNonEmptyString(parsed.finder),
+            sourceNode: toNonEmptyString(parsed.sourceNode) ?? MONERO_DAEMON_NAME,
+            updatedAt: toFiniteInteger(parsed.updatedAt) ?? 0
+        };
+    } catch (error) {
+        logWarn('Failed to parse explorer block detail record.', {
+            valuePreview: value.slice(0, 200),
+            ...formatError(error)
+        });
+        return null;
+    }
+}
+
+async function mapWithConcurrency<T, R>(
+    values: T[],
+    concurrency: number,
+    mapper: (value: T, index: number) => Promise<R>
+): Promise<R[]> {
+    if (values.length === 0) {
+        return [];
+    }
+
+    const results = new Array<R>(values.length);
+    const workerCount = Math.max(1, Math.min(concurrency, values.length));
+    let cursor = 0;
+
+    const workers = Array.from({ length: workerCount }, async () => {
+        while (true) {
+            const index = cursor;
+            cursor += 1;
+
+            if (index >= values.length) {
+                return;
+            }
+
+            const currentValue = values[index];
+            if (currentValue === undefined) {
+                return;
+            }
+
+            results[index] = await mapper(currentValue, index);
+        }
+    });
+
+    await Promise.all(workers);
+    return results;
+}
+
 async function callMoneroJsonRpc<T>(method: string, params?: Record<string, unknown>): Promise<T | null> {
     for (let attempt = 0; attempt <= BLOCK_RPC_MAX_RETRIES; attempt += 1) {
         try {
@@ -771,6 +881,189 @@ async function fetchFullBlockByHeight(height: number): Promise<MoneroGetBlockRes
     return callMoneroJsonRpc<MoneroGetBlockResult>('get_block', { height });
 }
 
+function buildExplorerBlockDetailRecord(
+    block: ExplorerBlockRecord,
+    txHashes: string[],
+    minerTxHash: string | null,
+    updatedAt: number
+): ExplorerBlockDetailRecord {
+    return {
+        height: block.height,
+        hash: block.hash,
+        prevHash: block.prevHash,
+        timestamp: block.timestamp,
+        difficulty: block.difficulty,
+        reward: block.reward,
+        blockWeight: block.blockWeight,
+        nonce: block.nonce,
+        txCount: block.txCount,
+        txHashes: uniqueStrings(txHashes),
+        minerTxHash,
+        finder: block.finder,
+        sourceNode: MONERO_DAEMON_NAME,
+        updatedAt
+    };
+}
+
+async function syncExplorerBlockDetails(blocks: ExplorerBlockRecord[]): Promise<void> {
+    if (blocks.length === 0) {
+        return;
+    }
+
+    const detailKeys = blocks.map(block => `monero:block-detail:${block.height}`);
+    const existingRaw = await redis.mget(...detailKeys);
+    const existingByHeight = new Map<number, ExplorerBlockDetailRecord>();
+
+    existingRaw.forEach((value, index) => {
+        const parsed = parseExplorerBlockDetail(value);
+        const block = blocks[index];
+        if (parsed) {
+            if (block) {
+                existingByHeight.set(block.height, parsed);
+            }
+        }
+    });
+
+    const fetchTargets = blocks.filter(block => {
+        const existing = existingByHeight.get(block.height);
+
+        if (!existing) {
+            return true;
+        }
+
+        if (existing.hash !== block.hash) {
+            return true;
+        }
+
+        if (existing.txHashes.length !== block.txCount) {
+            return true;
+        }
+
+        if (!existing.minerTxHash) {
+            return true;
+        }
+
+        return false;
+    });
+
+    if (fetchTargets.length > 0) {
+        logInfo('Explorer sync fetching block detail payloads.', {
+            requestedCount: fetchTargets.length,
+            concurrency: BLOCK_FETCH_CONCURRENCY
+        });
+    }
+
+    const fetchedDetails = new Map<number, { txHashes: string[]; minerTxHash: string | null }>();
+    const failedHeights: number[] = [];
+
+    const fetchedResults = await mapWithConcurrency(fetchTargets, BLOCK_FETCH_CONCURRENCY, async (block) => {
+        try {
+            const rpcPayload = await fetchFullBlockByHeight(block.height);
+            if (!rpcPayload) {
+                throw new Error(`Missing block payload for height ${block.height}`);
+            }
+
+            const parsedBlockJson = parseMoneroBlockJson(rpcPayload.json);
+            const txHashes = uniqueStrings([
+                ...toStringArray(rpcPayload.tx_hashes),
+                ...toStringArray(parsedBlockJson?.tx_hashes)
+            ]);
+            const minerTxHash = toNonEmptyString(rpcPayload.miner_tx_hash);
+
+            return {
+                height: block.height,
+                txHashes,
+                minerTxHash,
+                ok: true as const
+            };
+        } catch (error) {
+            logWarn('Failed to fetch explorer block detail for one block.', {
+                height: block.height,
+                ...formatError(error)
+            });
+
+            return {
+                height: block.height,
+                txHashes: [],
+                minerTxHash: null,
+                ok: false as const
+            };
+        }
+    });
+
+    for (const detail of fetchedResults) {
+        if (detail.ok) {
+            fetchedDetails.set(detail.height, {
+                txHashes: detail.txHashes,
+                minerTxHash: detail.minerTxHash
+            });
+            continue;
+        }
+
+        failedHeights.push(detail.height);
+    }
+
+    const updatedAt = Date.now();
+    const pipeline = redis.pipeline();
+    let writes = 0;
+    let commandCount = 0;
+
+    for (const block of blocks) {
+        const existing = existingByHeight.get(block.height);
+        const fetched = fetchedDetails.get(block.height);
+        const hasFreshDetail = fetched !== undefined;
+        const canReuseExisting = existing?.hash === block.hash;
+
+        if (!hasFreshDetail && !canReuseExisting) {
+            if (block.hash) {
+                pipeline.set(`monero:block-detail-hash:${block.hash}`, String(block.height));
+                commandCount += 1;
+            }
+            continue;
+        }
+
+        const currentTxHashes = fetched?.txHashes ?? (existing?.hash === block.hash ? existing.txHashes : []);
+        const currentMinerTxHash = fetched?.minerTxHash ?? (existing?.hash === block.hash ? existing.minerTxHash : null);
+        const nextRecord = buildExplorerBlockDetailRecord(block, currentTxHashes, currentMinerTxHash, updatedAt);
+
+        if (existing?.hash && existing.hash !== nextRecord.hash) {
+            pipeline.del(`monero:block-detail-hash:${existing.hash}`);
+            commandCount += 1;
+        }
+
+        if (JSON.stringify(existing) !== JSON.stringify(nextRecord)) {
+            pipeline.set(`monero:block-detail:${block.height}`, JSON.stringify(nextRecord));
+            writes += 1;
+            commandCount += 1;
+        }
+
+        if (nextRecord.hash) {
+            pipeline.set(`monero:block-detail-hash:${nextRecord.hash}`, String(block.height));
+            commandCount += 1;
+        }
+    }
+
+    if (writes > 0) {
+        await pipeline.exec();
+        logInfo('Updated explorer block detail cache.', {
+            blockCount: blocks.length,
+            writes
+        });
+        return;
+    }
+
+    if (commandCount > 0) {
+        await pipeline.exec();
+    }
+
+    if (failedHeights.length > 0) {
+        logWarn('Explorer block detail sync completed with partial failures.', {
+            failedCount: failedHeights.length,
+            failedHeights: failedHeights.slice(0, 20)
+        });
+    }
+}
+
 async function collectExplorerBlocks() {
     const startedAt = Date.now();
     logInfo('Explorer sync started.');
@@ -878,7 +1171,14 @@ async function collectExplorerBlocks() {
         block.finder = block.hash ? (explorerFinderByHash.get(block.hash) ?? null) : null;
     }
 
+    try {
+        await syncExplorerBlockDetails(blocksToStore);
+    } catch (error) {
+        logWarn('Continuing explorer snapshot update without refreshed block details.', formatError(error));
+    }
+
     const startHeight = blocksToStore.at(-1)?.height ?? targetStartHeight;
+    const collectedTxCount = blocksToStore.reduce((sum, block) => sum + block.txCount, 0);
 
     await setRedisJson('monero:explorer', {
         range: {
@@ -888,7 +1188,7 @@ async function collectExplorerBlocks() {
         },
         node: MONERO_DAEMON_NAME,
         blocks: blocksToStore,
-        collectedTxCount: 0,
+        collectedTxCount,
         mode: 'headers-only',
         updatedAt: Date.now()
     });
