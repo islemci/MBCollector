@@ -19,6 +19,55 @@ const BLOCK_RPC_TIMEOUT_MS = 7000;
 const BLOCK_RPC_MAX_RETRIES = 2;
 const MAX_HEADERS_PER_RANGE_REQUEST = 500;
 
+type LogLevel = 'INFO' | 'WARN' | 'ERROR';
+
+function formatError(error: unknown): Record<string, unknown> {
+    if (error instanceof Error) {
+        return {
+            name: error.name,
+            message: error.message,
+            stack: error.stack
+        };
+    }
+
+    return {
+        error: String(error)
+    };
+}
+
+function log(level: LogLevel, message: string, context?: Record<string, unknown>): void {
+    const timestamp = new Date().toISOString();
+    const payload = context ? ` ${JSON.stringify(context)}` : '';
+    const line = `[${timestamp}] [${level}] ${message}${payload}`;
+
+    if (level === 'ERROR') {
+        console.error(line);
+        return;
+    }
+
+    if (level === 'WARN') {
+        console.warn(line);
+        return;
+    }
+
+    console.info(line);
+}
+
+function logInfo(message: string, context?: Record<string, unknown>): void {
+    log('INFO', message, context);
+}
+
+function logWarn(message: string, context?: Record<string, unknown>): void {
+    log('WARN', message, context);
+}
+
+function logError(message: string, error?: unknown, context?: Record<string, unknown>): void {
+    log('ERROR', message, {
+        ...context,
+        ...(error === undefined ? {} : formatError(error))
+    });
+}
+
 let lastBlocksHeightFetched: number | null = null;
 let lastExplorerHeightFetched: number | null = null;
 
@@ -190,10 +239,15 @@ type NormalizedMoneroBlockHeader = {
     nonce: number | null;
 };
 
+type MoneroBlockWithFinder = NormalizedMoneroBlockHeader & {
+    finder: string | null;
+};
+
 type ExplorerBlockRecord = {
     height: number;
     header: NormalizedMoneroBlockHeader;
     hash: string | null;
+    finder: string | null;
     difficulty: number | null;
     timestamp: number | null;
     reward: number | null;
@@ -210,6 +264,51 @@ type ExplorerSnapshot = {
         count?: number;
     };
     blocks?: ExplorerBlockRecord[];
+};
+
+type PoolBlockAnnouncement = {
+    hash: string | null;
+    height: number | null;
+    finder: string;
+};
+
+type SupportXmrBlockResponse = Array<{
+    hash?: string;
+    height?: number;
+}>;
+
+type NanoPoolBlocksResponse = {
+    status?: boolean;
+    data?: Array<{
+        hash?: string;
+        number?: number;
+    }>;
+};
+
+type GenericPoolBlocksResponse = Array<{
+    hash?: string;
+    height?: number;
+}>;
+
+type XmrPoolEuStatsResponse = {
+    pool?: {
+        blocks?: unknown;
+    };
+};
+
+type SoloPoolBlocksResponse = {
+    matured?: Array<{
+        hash?: string;
+        height?: number;
+    }>;
+    immature?: Array<{
+        hash?: string;
+        height?: number;
+    }> | null;
+    candidates?: Array<{
+        hash?: string;
+        height?: number;
+    }> | null;
 };
 
 function toFiniteNumber(value: unknown): number | null {
@@ -347,6 +446,23 @@ function toFiniteInteger(value: unknown): number | null {
     return Math.trunc(value);
 }
 
+function toFiniteIntegerLike(value: unknown): number | null {
+    if (typeof value === 'number') {
+        return Number.isFinite(value) ? Math.trunc(value) : null;
+    }
+
+    if (typeof value === 'string' && value.trim().length > 0) {
+        const parsed = Number(value);
+        return Number.isFinite(parsed) ? Math.trunc(parsed) : null;
+    }
+
+    return null;
+}
+
+function toNonEmptyString(value: unknown): string | null {
+    return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
 function normalizeBlockHeader(header: MoneroBlockHeaderRpc): NormalizedMoneroBlockHeader {
     return {
         height: toFiniteInteger(header.height),
@@ -364,6 +480,36 @@ function normalizeBlockHeader(header: MoneroBlockHeaderRpc): NormalizedMoneroBlo
     };
 }
 
+function normalizePoolAnnouncement(hash: unknown, height: unknown, finder: string): PoolBlockAnnouncement | null {
+    const normalizedHash = toNonEmptyString(hash);
+    const normalizedHeight = toFiniteIntegerLike(height);
+
+    if (!normalizedHash || normalizedHeight === null) {
+        return null;
+    }
+
+    return {
+        hash: normalizedHash,
+        height: normalizedHeight,
+        finder
+    };
+}
+
+function filterAnnouncementsForTargetBlocks(
+    announcements: Array<PoolBlockAnnouncement | null>,
+    targetHeights: Set<number>,
+    targetHashes: Set<string>
+): PoolBlockAnnouncement[] {
+    return announcements.filter((announcement): announcement is PoolBlockAnnouncement => {
+        if (!announcement || !announcement.hash) {
+            return false;
+        }
+
+        return targetHashes.has(announcement.hash)
+            || (announcement.height !== null && targetHeights.has(announcement.height));
+    });
+}
+
 async function setRedisJson(key: string, value: unknown): Promise<void> {
     await redis.set(key, JSON.stringify(value));
 }
@@ -379,7 +525,11 @@ function parseJsonIfString(value: unknown): unknown | null {
 
     try {
         return JSON.parse(value);
-    } catch {
+    } catch (error) {
+        logWarn('Failed to parse JSON string value.', {
+            valuePreview: value.slice(0, 200),
+            ...formatError(error)
+        });
         return null;
     }
 }
@@ -437,7 +587,11 @@ function parseExplorerSnapshot(value: string | null): ExplorerSnapshot | null {
         }
 
         return parsed;
-    } catch {
+    } catch (error) {
+        logWarn('Failed to parse existing explorer snapshot from Redis.', {
+            valuePreview: value.slice(0, 200),
+            ...formatError(error)
+        });
         return null;
     }
 }
@@ -523,11 +677,18 @@ async function callMoneroJsonRpc<T>(method: string, params?: Record<string, unkn
             const isLastAttempt = attempt === BLOCK_RPC_MAX_RETRIES;
 
             if (isLastAttempt) {
-                console.log(`RPC call failed for ${method}: ${String(error)}`);
+                logError('RPC call failed.', error, { method, params, attempt: attempt + 1 });
                 return null;
             }
 
             const backoffMs = 300 * (2 ** attempt);
+            logWarn('RPC call failed, retrying.', {
+                method,
+                params,
+                attempt: attempt + 1,
+                nextRetryInMs: backoffMs,
+                ...formatError(error)
+            });
             await sleepMs(backoffMs);
         }
     }
@@ -556,11 +717,18 @@ async function callMoneroEndpoint<T>(path: string, body: Record<string, unknown>
             const isLastAttempt = attempt === BLOCK_RPC_MAX_RETRIES;
 
             if (isLastAttempt) {
-                console.log(`Daemon call failed for ${path}: ${String(error)}`);
+                logError('Daemon call failed.', error, { path, body, attempt: attempt + 1 });
                 return null;
             }
 
             const backoffMs = 300 * (2 ** attempt);
+            logWarn('Daemon call failed, retrying.', {
+                path,
+                body,
+                attempt: attempt + 1,
+                nextRetryInMs: backoffMs,
+                ...formatError(error)
+            });
             await sleepMs(backoffMs);
         }
     }
@@ -577,7 +745,11 @@ async function fetchLatestBlockHeadersRange(startHeight: number, endHeight: numb
     const headers = rpcPayload?.headers;
 
     if (!Array.isArray(headers)) {
-        console.log('RPC response missing headers array for get_block_headers_range.');
+        logError('RPC response missing headers array for get_block_headers_range.', undefined, {
+            startHeight,
+            endHeight,
+            rpcPayload
+        });
         return null;
     }
 
@@ -601,17 +773,19 @@ async function fetchFullBlockByHeight(height: number): Promise<MoneroGetBlockRes
 
 async function collectExplorerBlocks() {
     const startedAt = Date.now();
-    console.log('[Explorer] Sync start...');
+    logInfo('Explorer sync started.');
 
     const latestBlockHeight = await fetchLatestBlockHeightFromMullvad();
 
     if (latestBlockHeight === null) {
-        console.log('Skipping monero:explorer update, Mullvad latest height is unavailable.');
+        logWarn('Skipping monero:explorer update because Mullvad latest height is unavailable.');
         return;
     }
 
     if (lastExplorerHeightFetched === latestBlockHeight) {
-        console.log(`Skipping monero:explorer update, height unchanged at ${latestBlockHeight}.`);
+        logInfo('Skipping monero:explorer update because height is unchanged.', {
+            latestBlockHeight
+        });
     }
 
     const targetStartHeight = Math.max(0, latestBlockHeight - (EXPLORER_BLOCKS_TO_COLLECT - 1));
@@ -652,7 +826,10 @@ async function collectExplorerBlocks() {
     const missingRanges = getMissingHeightRanges(targetStartHeight, targetEndHeight, presentHeights);
 
     if (missingRanges.length > 0) {
-        console.log(`[Explorer] Missing ${missingRanges.length} range(s), fetching ${missingRanges.reduce((acc, r) => acc + (r.endHeight - r.startHeight + 1), 0)} headers...`);
+        logInfo('Explorer sync found missing ranges to backfill.', {
+            missingRangeCount: missingRanges.length,
+            missingHeaderCount: missingRanges.reduce((acc, r) => acc + (r.endHeight - r.startHeight + 1), 0)
+        });
     }
 
     for (const range of missingRanges) {
@@ -661,7 +838,10 @@ async function collectExplorerBlocks() {
         for (const chunk of chunkedRanges) {
             const headers = await fetchLatestBlockHeadersRange(chunk.startHeight, chunk.endHeight);
             if (!headers) {
-                console.log(`Skipping monero:explorer update, failed to fetch missing range ${chunk.startHeight}-${chunk.endHeight}.`);
+                logError('Skipping monero:explorer update because a missing range fetch failed.', undefined, {
+                    startHeight: chunk.startHeight,
+                    endHeight: chunk.endHeight
+                });
                 return;
             }
 
@@ -683,6 +863,7 @@ async function collectExplorerBlocks() {
             height: header.height,
             header,
             hash: header.hash,
+            finder: null,
             timestamp: header.timestamp,
             difficulty: header.difficulty,
             reward: header.reward,
@@ -691,6 +872,11 @@ async function collectExplorerBlocks() {
             prevHash: header.prevHash,
             nonce: header.nonce
         }));
+
+    const explorerFinderByHash = await fetchRecentBlockFinders(headersToStore);
+    for (const block of blocksToStore) {
+        block.finder = block.hash ? (explorerFinderByHash.get(block.hash) ?? null) : null;
+    }
 
     const startHeight = blocksToStore.at(-1)?.height ?? targetStartHeight;
 
@@ -709,12 +895,18 @@ async function collectExplorerBlocks() {
 
     lastExplorerHeightFetched = latestBlockHeight;
     const tookMs = Date.now() - startedAt;
-    console.log(`Done. Updated monero:explorer (${blocksToStore.length} headers, headers-only mode, ${tookMs}ms).`);
+    logInfo('Updated monero:explorer.', {
+        headerCount: blocksToStore.length,
+        mode: 'headers-only',
+        tookMs
+    });
 }
 
 async function collectRecentBlocks(latestHeight: number) {
     if (!Number.isFinite(latestHeight) || latestHeight <= 0) {
-        console.log('Skipping monero:blocks update, invalid latest height.');
+        logWarn('Skipping monero:blocks update because latest height is invalid.', {
+            latestHeight
+        });
         return;
     }
 
@@ -722,7 +914,9 @@ async function collectRecentBlocks(latestHeight: number) {
     const latestBlockHeight = Math.max(0, latestHeight - 1);
 
     if (lastBlocksHeightFetched === latestBlockHeight) {
-        console.log(`Skipping monero:blocks update, height unchanged at ${latestBlockHeight}.`);
+        logInfo('Skipping monero:blocks update because height is unchanged.', {
+            latestBlockHeight
+        });
         return;
     }
 
@@ -736,19 +930,31 @@ async function collectRecentBlocks(latestHeight: number) {
     }
 
     if (headers.length !== expectedCount) {
-        console.log(
-            `Skipping monero:blocks update, partial response (${headers.length}/${expectedCount} headers).`
-        );
+        logWarn('Skipping monero:blocks update because the header response was partial.', {
+            receivedHeaders: headers.length,
+            expectedHeaders: expectedCount,
+            startHeight,
+            latestBlockHeight
+        });
         return;
     }
 
     const hasRequiredFields = headers.every(h => h.height !== null && h.timestamp !== null && h.hash !== null);
     if (!hasRequiredFields) {
-        console.log('Skipping monero:blocks update, one or more headers are missing required fields.');
+        logError('Skipping monero:blocks update because required header fields are missing.', undefined, {
+            startHeight,
+            latestBlockHeight
+        });
         return;
     }
 
-    const blocks = [...headers].sort((a, b) => (b.height ?? 0) - (a.height ?? 0));
+    const finderByHash = await fetchRecentBlockFinders(headers);
+    const blocks: MoneroBlockWithFinder[] = [...headers]
+        .sort((a, b) => (b.height ?? 0) - (a.height ?? 0))
+        .map(header => ({
+            ...header,
+            finder: header.hash ? (finderByHash.get(header.hash) ?? null) : null
+        }));
 
     await setRedisJson('monero:blocks', {
         range: {
@@ -762,37 +968,197 @@ async function collectRecentBlocks(latestHeight: number) {
     });
 
     lastBlocksHeightFetched = latestBlockHeight;
-    console.log(`Done. Updated monero:blocks (${blocks.length} headers).`);
+    logInfo('Updated monero:blocks.', {
+        headerCount: blocks.length
+    });
 }
 
 const fetchWithTimeout = <T>(url: string): Promise<T | null> =>
     fetch(url, { signal: AbortSignal.timeout(5000) })
-        .then(res => res.json() as Promise<T>)
-        .catch(() => null);
+        .then(async res => {
+            if (!res.ok) {
+                throw new Error(`HTTP ${res.status}`);
+            }
+
+            return await res.json() as T;
+        })
+        .catch(error => {
+            logWarn('HTTP JSON fetch failed.', {
+                url,
+                ...formatError(error)
+            });
+            return null;
+        });
 
 const fetchWithTimeoutText = <T>(url: string): Promise<T | null> =>
     fetch(url, { signal: AbortSignal.timeout(5000) })
         .then(async res => {
+            if (!res.ok) {
+                throw new Error(`HTTP ${res.status}`);
+            }
+
             try {
                 return await res.json() as T;
-            } catch {
+            } catch (jsonError) {
                 try {
                     return JSON.parse(await res.text()) as T;
-                } catch {
+                } catch (textError) {
+                    logWarn('Failed to parse HTTP response body as JSON.', {
+                        url,
+                        initialJsonError: formatError(jsonError),
+                        ...formatError(textError)
+                    });
                     return null;
                 }
             }
         })
-        .catch(() => null);
+        .catch(error => {
+            logWarn('HTTP fetch failed.', {
+                url,
+                ...formatError(error)
+            });
+            return null;
+        });
+
+async function fetchSupportXmrAnnouncements(targetHeights: Set<number>, targetHashes: Set<string>): Promise<PoolBlockAnnouncement[]> {
+    const response = await fetchWithTimeout<SupportXmrBlockResponse>('https://www.supportxmr.com/api/pool/blocks');
+    const announcements = (response ?? []).map(block => normalizePoolAnnouncement(block.hash, block.height, 'SupportXMR'));
+    return filterAnnouncementsForTargetBlocks(announcements, targetHeights, targetHashes);
+}
+
+async function fetchNanoPoolAnnouncements(targetHeights: Set<number>, targetHashes: Set<string>): Promise<PoolBlockAnnouncement[]> {
+    const response = await fetchWithTimeout<NanoPoolBlocksResponse>('https://api.nanopool.org/v1/xmr/blocks/0/50');
+
+    if (!response?.status || !Array.isArray(response.data)) {
+        return [];
+    }
+
+    const announcements = response.data.map(block => normalizePoolAnnouncement(block.hash, block.number, 'NanoPool'));
+    return filterAnnouncementsForTargetBlocks(announcements, targetHeights, targetHashes);
+}
+
+async function fetchGenericPoolAnnouncements(
+    url: string,
+    finder: string,
+    targetHeights: Set<number>,
+    targetHashes: Set<string>
+): Promise<PoolBlockAnnouncement[]> {
+    const response = await fetchWithTimeout<GenericPoolBlocksResponse>(url);
+    const announcements = (response ?? []).map(block => normalizePoolAnnouncement(block.hash, block.height, finder));
+    return filterAnnouncementsForTargetBlocks(announcements, targetHeights, targetHashes);
+}
+
+async function fetchXmrPoolEuAnnouncements(targetHeights: Set<number>, targetHashes: Set<string>): Promise<PoolBlockAnnouncement[]> {
+    const response = await fetchWithTimeoutText<XmrPoolEuStatsResponse>('https://web.xmrpool.eu:8119/stats');
+    const rawBlocks = response?.pool?.blocks;
+
+    if (!Array.isArray(rawBlocks)) {
+        return [];
+    }
+
+    const announcements: PoolBlockAnnouncement[] = [];
+
+    for (let index = 0; index < rawBlocks.length - 1; index += 2) {
+        const encodedBlock = rawBlocks[index];
+        const heightValue = rawBlocks[index + 1];
+
+        if (typeof encodedBlock !== 'string') {
+            continue;
+        }
+
+        const [hash] = encodedBlock.split(':');
+        const announcement = normalizePoolAnnouncement(hash, heightValue, 'XMRPoolEU');
+        if (announcement) {
+            announcements.push(announcement);
+        }
+    }
+
+    return filterAnnouncementsForTargetBlocks(announcements, targetHeights, targetHashes);
+}
+
+async function fetchSoloPoolAnnouncements(targetHeights: Set<number>, targetHashes: Set<string>): Promise<PoolBlockAnnouncement[]> {
+    const response = await fetchWithTimeout<SoloPoolBlocksResponse>('https://xmr.solopool.org/api/blocks');
+    const rawBlocks = [
+        ...(response?.candidates ?? []),
+        ...(response?.immature ?? []),
+        ...(response?.matured ?? [])
+    ];
+    const announcements = rawBlocks.map(block => normalizePoolAnnouncement(block.hash, block.height, 'SoloPool'));
+    return filterAnnouncementsForTargetBlocks(announcements, targetHeights, targetHashes);
+}
+
+async function fetchRecentBlockFinders(headers: NormalizedMoneroBlockHeader[]): Promise<Map<string, string>> {
+    const targetHeights = new Set<number>();
+    const targetHashes = new Set<string>();
+
+    for (const header of headers) {
+        if (header.height !== null) {
+            targetHeights.add(header.height);
+        }
+
+        if (header.hash) {
+            targetHashes.add(header.hash);
+        }
+    }
+
+    if (targetHashes.size === 0) {
+        return new Map();
+    }
+
+    const settled = await Promise.allSettled([
+        fetchSupportXmrAnnouncements(targetHeights, targetHashes),
+        fetchNanoPoolAnnouncements(targetHeights, targetHashes),
+        fetchGenericPoolAnnouncements('https://p2pool.io/api/pool/blocks', 'P2Pool', targetHeights, targetHashes),
+        fetchGenericPoolAnnouncements('https://api.c3pool.org/pool/blocks', 'C3Pool', targetHeights, targetHashes),
+        fetchGenericPoolAnnouncements('https://api.moneroocean.stream/pool/blocks', 'MoneroOcean', targetHeights, targetHashes),
+        fetchGenericPoolAnnouncements('https://api.skypool.xyz/pool/blocks', 'SkyPool', targetHeights, targetHashes),
+        fetchXmrPoolEuAnnouncements(targetHeights, targetHashes),
+        fetchSoloPoolAnnouncements(targetHeights, targetHashes),
+        fetchGenericPoolAnnouncements('https://np-api.monerod.org/pool/blocks', 'Monerod', targetHeights, targetHashes)
+    ]);
+
+    const finderByHash = new Map<string, string>();
+
+    for (const result of settled) {
+        if (result.status !== 'fulfilled') {
+            logWarn('Failed to fetch block finder announcements from one source.', formatError(result.reason));
+            continue;
+        }
+
+        for (const announcement of result.value) {
+            if (!announcement.hash) {
+                continue;
+            }
+
+            const existingFinder = finderByHash.get(announcement.hash);
+            if (existingFinder && existingFinder !== announcement.finder) {
+                logWarn('Conflicting block finder announcements detected.', {
+                    hash: announcement.hash,
+                    existingFinder,
+                    incomingFinder: announcement.finder
+                });
+                continue;
+            }
+
+            finderByHash.set(announcement.hash, announcement.finder);
+        }
+    }
+
+    return finderByHash;
+}
 
 async function aggregate() {
-    console.log(`[${new Date().toISOString()}] Starting aggregation...`);
+    logInfo('Starting aggregation.');
 
     const fetchNodeWithMetrics = async (node: NodeConfig): Promise<NodeMetric> => {
         const startedAt = Date.now();
 
         try {
             const response = await fetch(node.url, { signal: AbortSignal.timeout(5000) });
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
+            }
+
             const data = await response.json() as NodeInfo;
             const pingMs = Date.now() - startedAt;
 
@@ -804,7 +1170,12 @@ async function aggregate() {
                 height: typeof data?.height === 'number' ? data.height : null,
                 difficulty: typeof data?.difficulty === 'number' ? data.difficulty : null
             };
-        } catch {
+        } catch (error) {
+            logWarn('Node health check failed.', {
+                node: node.name,
+                url: node.url,
+                ...formatError(error)
+            });
             return {
                 name: node.name,
                 url: node.url,
@@ -829,8 +1200,11 @@ async function aggregate() {
                     return data.raw.data;
                 }
             }
-        } catch {
-            // fall through to fallback extractor
+        } catch (error) {
+            logWarn('Pool hashrate normalization failed; falling back to generic extractor.', {
+                pool: name,
+                ...formatError(error)
+            });
         }
         return extractHash(name, data);
     };
@@ -839,7 +1213,12 @@ async function aggregate() {
         Promise.all(POOLS.map(async p => {
             const result = await fetchWithTimeoutText<any>(p.url);
             const hashApi = getPoolHashrateFromApi(p.name, result);
-            console.log(`[Pool] ${p.name} | status=${result ? 'online' : 'offline'} | raw=${JSON.stringify(result)?.slice(0, 200)} | hash=${hashApi}`);
+            logInfo('Pool fetch completed.', {
+                pool: p.name,
+                status: result ? 'online' : 'offline',
+                hash: hashApi,
+                rawPreview: JSON.stringify(result)?.slice(0, 200) ?? null
+            });
             return result;
         })),
         Promise.all(NODES.map(node => fetchNodeWithMetrics(node)))
@@ -853,9 +1232,13 @@ async function aggregate() {
     const networkHashrate = roundUpHashrate(difficulty / 120);
 
     for (const node of nodeResults) {
-        console.log(
-            `[Node] ${node.name} | ${node.status} | ping=${node.pingMs ?? 'timeout'}ms | height=${node.height ?? '-'} | difficulty=${node.difficulty ?? '-'}`
-        );
+        logInfo('Node metric collected.', {
+            node: node.name,
+            status: node.status,
+            pingMs: node.pingMs,
+            height: node.height,
+            difficulty: node.difficulty
+        });
     }
 
     const payload = {
@@ -892,30 +1275,34 @@ async function aggregate() {
     if (bestHeight > 0) {
         await collectRecentBlocks(bestHeight);
     } else {
-        console.log('Skipping monero:blocks update, no consensus height available.');
+        logWarn('Skipping monero:blocks update because no consensus height is available.');
     }
 
     await collectExplorerBlocks();
 
-    console.log(`Done. Height: ${bestHeight}`);
+    logInfo('Aggregation finished.', {
+        bestHeight,
+        difficulty,
+        networkHashrate
+    });
 }
 
 async function collectMoneroInfo() {
-    console.log(`[${new Date().toISOString()}] Fetching CoinGecko monero info...`);
+    logInfo('Fetching CoinGecko monero info.');
 
     const coingeckoData = await fetchWithTimeout<CoinGeckoMoneroResponse>(
         'https://api.coingecko.com/api/v3/coins/monero?localization=false&tickers=false&community_data=false&developer_data=false&sparkline=false'
     );
 
     if (!coingeckoData) {
-        console.log('CoinGecko fetch failed. Keeping last monero:info payload.');
+        logWarn('CoinGecko fetch failed. Keeping last monero:info payload.');
         return;
     }
 
     const moneroInfo = buildMoneroInfoPayload(coingeckoData);
     await setRedisJson("monero:info", moneroInfo);
 
-    console.log('Done. Updated monero:info.');
+    logInfo('Updated monero:info.');
 }
 
 function extractHash(name: string, data: any): number {
@@ -1008,8 +1395,22 @@ function extractHash(name: string, data: any): number {
     }
 }
 
-setInterval(aggregate, 300000);
-setInterval(collectMoneroInfo, 300000);
+function runJob(name: string, job: () => Promise<void>): void {
+    job().catch(error => {
+        logError(`Scheduled job "${name}" failed.`, error);
+    });
+}
 
-aggregate();
-collectMoneroInfo();
+process.on('unhandledRejection', reason => {
+    logError('Unhandled promise rejection.', reason);
+});
+
+process.on('uncaughtException', error => {
+    logError('Uncaught exception.', error);
+});
+
+setInterval(() => runJob('aggregate', aggregate), 300000);
+setInterval(() => runJob('collectMoneroInfo', collectMoneroInfo), 300000);
+
+runJob('aggregate', aggregate);
+runJob('collectMoneroInfo', collectMoneroInfo);

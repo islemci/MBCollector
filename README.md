@@ -13,12 +13,14 @@ MoneroBar Collector fetches Monero network and pool statistics, normalizes hashr
 	- reward
 	- num_txes
 	- hash
+	- finder (pool that announced the solved block, when available)
 	- orphan_status
 	- depth
 	- cumulative_difficulty
 - Latest 100 Monero block headers from the Mullvad daemon stored in Redis key `monero:explorer` (headers-only mode), including:
 	- height
 	- hash
+	- finder (pool that announced the solved block, when available)
 	- timestamp (unix)
 	- difficulty
 	- reward
